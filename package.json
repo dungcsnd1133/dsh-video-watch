@@ -1,0 +1,19 @@
+{
+  "name": "dsh-video-watch",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DSH tool that downloads a video link, samples frames, and transcribes speech.",
+  "license": "MIT",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "^0.2.1-rc.5"
+  }
+}
