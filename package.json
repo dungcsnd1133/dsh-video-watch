@@ -11,9 +11,15 @@
   },
   "files": [
     "index.js",
+    "cordis.patch.yml",
     "README.md"
   ],
   "peerDependencies": {
     "@deepseek-ai/dsh-tools": "^0.2.1-rc.5"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
   }
 }
