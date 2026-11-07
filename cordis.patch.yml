@@ -1,1 +1,8 @@
-[]
+# Mounts the plugin entry. A bundle patch only overrides rows that already
+# exist — it never mounts a plugin by itself, so an insert row is what makes
+# `dsh plugin add` actually load index.js and register the watch_video tool.
+# Without this row the package installs, the manager shows it, and no tool ever
+# appears: apply() is never called.
+- insert:
+    - id: video-watch
+      name: dsh-video-watch
