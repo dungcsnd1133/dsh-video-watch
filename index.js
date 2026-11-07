@@ -1,9 +1,9 @@
 /**
  * One tool, watch_video. Download a public video, sample frames, and
- * transcribe speech when XAI_API_KEY is set.
+ * transcribe speech through Groq Whisper when GROQ_API_KEY is set.
  */
 import { spawn } from 'node:child_process'
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
@@ -95,15 +95,30 @@ async function durationOf(file, signal) {
   return Number.isFinite(value) ? value : 0
 }
 
+/**
+ * Transcribe one audio buffer through Groq's OpenAI-compatible endpoint.
+ *
+ * Groq rather than xAI: the same account already pays for it, the free tier is
+ * usable, and whisper-large-v3-turbo is markedly cheaper per hour than the model
+ * this used before. Both Whisper variants are multilingual, which is why the
+ * `language` hint is passed through rather than left to auto-detection — a
+ * Vietnamese clip transcribed as English produces confident nonsense, and a
+ * two-letter hint costs nothing.
+ *
+ * @param {Buffer} audio - mp3 bytes.
+ * @param {string | undefined} language - ISO-639-1 hint.
+ * @param {AbortSignal | undefined} signal - cancellation.
+ * @returns {Promise<string | null>} transcript, or null when no key is set.
+ */
 async function transcribe(audio, language, signal) {
-  const key = process.env.XAI_API_KEY
+  const key = process.env.GROQ_API_KEY
   if (!key) return null
   const form = new FormData()
-  form.append('model', 'grok-voice-transcribe-2.0')
-  form.append('format', 'true')
+  form.append('model', GROQ_STT_MODEL)
+  form.append('response_format', 'json')
   if (language) form.append('language', language)
   form.append('file', new Blob([audio], { type: 'audio/mpeg' }), 'audio.mp3')
-  const response = await fetch('https://api.x.ai/v1/stt', {
+  const response = await fetch(GROQ_STT_URL, {
     method: 'POST',
     signal,
     headers: { authorization: `Bearer ${key}` },
@@ -111,16 +126,72 @@ async function transcribe(audio, language, signal) {
   })
   if (!response.ok) {
     const detail = (await response.text()).slice(0, 300)
-    throw new Error(`xAI speech-to-text failed (${response.status}): ${detail}`)
+    throw new Error(`Groq speech-to-text failed (${response.status}): ${detail}`)
   }
   const payload = await response.json()
   return typeof payload.text === 'string' ? payload.text.trim() : ''
 }
 
+/**
+ * Transcribe audio longer than one request can carry.
+ *
+ * Groq takes 25 MB per request on the free tier and 100 MB on dev, and a
+ * 16 kHz mono 64 kbps mp3 of a one-hour talk is roughly 28 MB — so a long video
+ * fails as a single call with a 413 that reads like a bad key. Splitting on
+ * fixed time windows keeps each request small; the join is a plain newline
+ * because each window is transcribed independently and the model already ends
+ * sentences where they end.
+ *
+ * @param {string} audioPath - the extracted mp3.
+ * @param {string} dir - scratch directory for the pieces.
+ * @param {string | undefined} language - language hint.
+ * @param {(argv: string[], options: object) => Promise<void>} run - ffmpeg runner.
+ * @param {{ signal?: AbortSignal }} exec - cancellation.
+ * @returns {Promise<string>} the joined transcript.
+ */
+async function transcribeInChunks(audioPath, dir, language, run, exec) {
+  const bytes = (await stat(audioPath)).size
+  if (bytes <= GROQ_CHUNK_BYTES) {
+    return transcribe(await readFile(audioPath), language, exec.signal)
+  }
+  const pieces = []
+  for (let index = 0; ; index += 1) {
+    const piece = join(dir, `audio-${index}.mp3`)
+    // -ss before -i seeks instead of decoding: a 40th window costs a seek, not
+    // a full re-read of everything before it.
+    await run('ffmpeg', [
+      '-y', '-ss', String(index * GROQ_CHUNK_SECONDS), '-t', String(GROQ_CHUNK_SECONDS),
+      '-i', audioPath, '-vn', '-ac', '1', '-ar', '16000', '-b:a', '64k', piece,
+    ], { signal: exec.signal, timeoutMs: 60000 })
+    const size = (await stat(piece)).size
+    // A window past the end produces an empty file; that is the stop condition.
+    if (size < 1024) break
+    const text = await transcribe(await readFile(piece), language, exec.signal)
+    if (text) pieces.push(text)
+    if (size < GROQ_CHUNK_BYTES) break
+    if (index > 500) break // hard stop: a runtime bound, not a content judgement
+  }
+  return pieces.join('\n')
+}
+
+/** Groq's OpenAI-compatible speech-to-text endpoint. */
+const GROQ_STT_URL = 'https://api.groq.com/openai/v1/audio/transcriptions'
+/**
+ * Model choice: `whisper-large-v3-turbo` is ~3x cheaper per hour than the
+ * non-turbo variant ($0.04 vs $0.111) and supports every language this tool
+ * needs. The slower model buys a lower word-error rate on hard audio; that is a
+ * deliberate override, not a default, so it lives in one named constant.
+ */
+const GROQ_STT_MODEL = process.env.GROQ_STT_MODEL || 'whisper-large-v3-turbo'
+/** Largest upload one Groq request accepts on the free tier. */
+const GROQ_CHUNK_BYTES = 24 * 1024 * 1024
+/** Seconds per chunk when the audio has to be split. */
+const GROQ_CHUNK_SECONDS = 900
+
 export function apply(ctx) {
   ctx.tools.register(defineTool({
     name: 'watch_video',
-    description: 'Download a YouTube, TikTok, Facebook, Instagram, X, or direct mp4 link. Return 8 to 24 frames and, when XAI_API_KEY is set, a transcript from POST /v1/stt using grok-voice-transcribe-2.0. Use this when the user gives a video link and wants to know what is in it.',
+    description: 'Download a YouTube, TikTok, Facebook, Instagram, X, or direct mp4 link. Return 8 to 24 frames and, when GROQ_API_KEY is set, a speech transcript from Groq Whisper (whisper-large-v3-turbo; audio over 24 MB is split into 15-minute windows first). Use this when the user gives a video link and wants to know what is in it.',
     timeoutMs: 240000,
     parameters: {
       url: { type: 'string', required: true, description: 'Public video page or a direct mp4 URL.' },
@@ -202,20 +273,24 @@ export function apply(ctx) {
           })
         }
         let transcript
-        let speechNote = 'Transcript skipped: XAI_API_KEY is not set.'
+        let speechNote = 'Transcript skipped: GROQ_API_KEY is not set.'
         try {
+          const audioPath = join(dir, 'audio.mp3')
           await run('ffmpeg', [
             '-y', '-i', videoPath, '-vn', '-ac', '1', '-ar', '16000', '-b:a', '64k',
-            join(dir, 'audio.mp3'),
-          ], { signal: exec.signal, timeoutMs: 60000 })
-          const audio = await readFile(join(dir, 'audio.mp3'))
-          if (!process.env.XAI_API_KEY) speechNote = 'Transcript skipped: XAI_API_KEY is not set.'
+            audioPath,
+          ], { signal: exec.signal, timeoutMs: 90000 })
+          if (!process.env.GROQ_API_KEY) speechNote = 'Transcript skipped: GROQ_API_KEY is not set.'
           else {
-            transcript = await transcribe(audio, language, exec.signal)
+            transcript = await transcribeInChunks(audioPath, dir, language, run, exec)
             speechNote = transcript ? 'Transcript included.' : 'No speech was detected.'
           }
         } catch (error) {
-          if (process.env.XAI_API_KEY) speechNote = `Transcript failed: ${error.message}`
+          // A missing key is a configuration state, not a failure: report it as
+          // "skipped" so the caller still gets the frames.
+          speechNote = process.env.GROQ_API_KEY
+            ? `Transcript failed: ${error.message}`
+            : 'Transcript skipped: GROQ_API_KEY is not set.'
         }
         const note = [
           `Watched ${url}.`,
